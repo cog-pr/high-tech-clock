@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QEasingCurve, QPointF, QRectF, QSize, Qt, QVariantAnimation
-from PySide6.QtGui import QColor, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 
 from .. import theme as T
@@ -396,6 +396,7 @@ class SegmentDisplay(QWidget):
         self._skew = skew
         self._align = align
         self._dim_tail = 0          # number of trailing chars drawn smaller (e.g. centiseconds)
+        self._glyphs: dict[tuple, tuple[QPixmap, float]] = {}
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(20)
 
@@ -452,38 +453,62 @@ class SegmentDisplay(QWidget):
         digit_h = (2 + _T_SEG) * u
         top = (H - digit_h) / 2
         mid = top + digit_h / 2
-        lit, ghost = QPainterPath(), QPainterPath()
-        lit.setFillRule(Qt.FillRule.WindingFill)
+        dpr = self.devicePixelRatioF()
         for i, ch in enumerate(self._text):
             uu = u * tail_scale if n_tail and i >= len(self._text) - n_tail else u
-            base_y = top + digit_h - (2 + _T_SEG) * uu       # tail digits share the baseline
-            hh = _T_SEG / 2
-
-            def mp(px: float, py: float) -> QPointF:
-                X = x + (px + hh) * uu
-                Y = base_y + (py + hh) * uu
-                return QPointF(X + self._skew * (mid - Y), Y)
-
-            if ch == ":":
-                for cy in (0.6, 1.4):
-                    sq = [mp(0.12, cy - 0.12), mp(0.36, cy - 0.12), mp(0.36, cy + 0.12), mp(0.12, cy + 0.12)]
-                    lit.addPolygon(QPolygonF(sq))
-                    lit.closeSubpath()
-            elif ch == ".":
-                sq = [mp(0.02, 1.86), mp(0.26, 1.86), mp(0.26, 2.1), mp(0.02, 2.1)]
-                lit.addPolygon(QPolygonF(sq))
-                lit.closeSubpath()
-            else:
-                on = _SEG_CHARS.get(ch.upper(), "")
-                for name, pts in _SEGMENTS.items():
-                    target = lit if name in on else ghost
-                    target.addPolygon(QPolygonF([mp(px, py) for px, py in pts]))
-                    target.closeSubpath()
+            gh = (2 + _T_SEG) * uu
+            base_y = top + digit_h - gh                       # tail digits share the baseline
+            pm, margin = self._glyph(ch, uu, u, dpr)
+            shift = self._skew * (mid - (base_y + gh))        # the italic slant is about `mid`
+            p.drawPixmap(QPointF(x + shift - margin, base_y - margin), pm)
             x += self._advance(ch, uu)
+
+    def _glyph(self, ch: str, uu: float, u: float, dpr: float) -> tuple[QPixmap, float]:
+        """One character with its ghost segments and glow, rendered once: stroking the glow on
+        every repaint is what made a 30 Hz stopwatch readout expensive."""
+        key = (ch, round(uu, 2), round(u, 2), self._color, self._glow, self._skew, dpr)
+        hit = self._glyphs.get(key)
+        if hit is not None:
+            return hit
+        if len(self._glyphs) > 96:
+            self._glyphs.clear()
+        hh = _T_SEG / 2
+        gh = (2 + _T_SEG) * uu
+        margin = max(2.0, u * 0.55) / 2 + 2
+        pm = QPixmap(max(1, math.ceil(((1 + _T_SEG) * uu + self._skew * gh + 2 * margin) * dpr)),
+                     max(1, math.ceil((gh + 2 * margin) * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+
+        def mp(px: float, py: float) -> QPointF:
+            y = (py + hh) * uu
+            return QPointF(margin + (px + hh) * uu + self._skew * (gh - y), margin + y)
+
+        lit, ghost = QPainterPath(), QPainterPath()
+        lit.setFillRule(Qt.FillRule.WindingFill)
+        if ch == ":":
+            for cy in (0.6, 1.4):
+                lit.addPolygon(QPolygonF([mp(0.12, cy - 0.12), mp(0.36, cy - 0.12),
+                                          mp(0.36, cy + 0.12), mp(0.12, cy + 0.12)]))
+                lit.closeSubpath()
+        elif ch == ".":
+            lit.addPolygon(QPolygonF([mp(0.02, 1.86), mp(0.26, 1.86), mp(0.26, 2.1), mp(0.02, 2.1)]))
+            lit.closeSubpath()
+        else:
+            on = _SEG_CHARS.get(ch.upper(), "")
+            for name, pts in _SEGMENTS.items():
+                target = lit if name in on else ghost
+                target.addPolygon(QPolygonF([mp(px, py) for px, py in pts]))
+                target.closeSubpath()
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillPath(ghost, T.qc(T.VIOLET_DEEP, 95))
         p.strokePath(lit, QPen(T.qc(self._glow, 34), max(2.0, u * 0.55)))
         p.strokePath(lit, QPen(T.qc(self._glow, 60), max(1.0, u * 0.22)))
         p.fillPath(lit, QColor(self._color))
+        p.end()
+        self._glyphs[key] = (pm, margin)
+        return pm, margin
 
 
 def elide_px(text: str, fm: QFontMetricsF, width: float) -> str:

@@ -1,25 +1,37 @@
 """The centre-piece: a skeletonised tourbillon chronograph drawn entirely with QPainter.
 
-Rendering is layered so that most frames only repaint the balance wheel:
+Rendering is change-driven so the clock can run at the full frame rate cheaply:
 
-    static (rebuilt on resize / date change)
+    static layers (rebuilt on resize / date change)
         under  ─ movement plate (perlage), engravings, wheel shadows
         over   ─ bridges, sub-dials, date windows, chapter ring, bezel
         glass  ─ crystal reflection
-    per beat (a 21 600 vph movement only moves in beat steps: 6×/s; "smooth" uses 30×/s)
-        lower  ─ under + gear train + tourbillon base (escape wheel, pallet fork)
-        upper  ─ cage + over + seconds track + timer bezel + all hands + glass
-        HUD    ─ rotating outer rings
-    per frame (a single small rect)
-        balance wheel & hairspring, which oscillate continuously
+    base (rebuilt when the window behind the clock changes)
+        backdrop + under, opaque
+    train layer (stepped sweep modes only, re-composed on each beat)
+        base + gear train + escape wheel & pallet fork
+    slow layer (re-rendered once a second)
+        over + timer bezel + sub-dial hands + hour & minute hands + glass
+    drawn per paint, only where something moved
+        gear train (smooth mode), tourbillon carriage (balance, hairspring, cage),
+        seconds & chronograph hands, seconds track, HUD arcs
 
-During the boot animation and live resizing the beat layers are bypassed and
-everything is drawn directly.
+Every frame `_on_frame` compares the moving parts with what was last painted and
+repaints only those rectangles: the tourbillon, the footprints of the sweeping
+hands, the gear train and the two ends of each HUD arc. The widget is opaque (it
+paints the window backdrop under itself), so these updates never reach the
+widgets behind it.
+
+Sweep modes: "smooth" moves the hands, cage and HUD arcs every frame (the gear
+train at 20 Hz, where a step is under half a pixel), "mechanical" steps them 6×/s
+(21 600 vph) and "quartz" once a second. The balance wheel always oscillates
+continuously.
 """
 from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
@@ -34,7 +46,6 @@ from PySide6.QtGui import (
     QPixmap,
     QPolygonF,
     QRadialGradient,
-    QRegion,
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -56,8 +67,10 @@ from .mechanics import (
 
 TAU = math.tau
 ROOT_OMEGA = TAU / 60.0                  # centre wheel turns once a minute
-BEATS = {"mechanical": 6, "quartz": 1, "smooth": 30}  # display steps / s (21 600 vph → 6)
+SWEEP_RATES = {"smooth": 0, "mechanical": 6, "quartz": 1}   # hand steps per second (0 = continuous)
+SMOOTH_TRAIN_RATE = 20                   # wheel teeth move < 0.5 px per step: steps are invisible
 ESCAPEMENT_BPS = 6                       # the balance & escape wheel always run at 21 600 vph
+HUD_ARC_SPEED = 6.0                      # degrees per second
 
 DIAL = 0.80                              # skeleton plate radius (units of R)
 SUB_D, SUB_R = 0.40, 0.165               # sub-dials at 3 and 9 o'clock
@@ -82,6 +95,55 @@ TRAIN = [
 def _ease_out(t: float) -> float:
     t = max(0.0, min(1.0, t))
     return 1.0 - (1.0 - t) ** 3
+
+
+def quantise(x: float, rate: int) -> float:
+    """Snap a time in seconds down to steps of 1/rate; rate 0 means continuous."""
+    return math.floor(x * rate) / rate if rate else x
+
+
+def _bounds(xs: list[float], ys: list[float], pad: float) -> QRect:
+    return QRectF(min(xs) - pad, min(ys) - pad,
+                  max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad).toAlignedRect()
+
+
+def needle_rects(c: QPointF, r: float, frac: float, tail: float, tip: float,
+                 pad: float, segments: int = 5) -> list[QRect]:
+    """Rects covering a hand that points at dial fraction `frac`, from `tail` behind the
+    pivot to `tip` (units of r). Split along its length so a diagonal hand does not
+    dirty its whole bounding box."""
+    a = T.clock_angle(frac)
+    ux, uy = math.cos(a), math.sin(a)
+    stops = [-tail + (tip + tail) * k / segments for k in range(segments + 1)]
+    return [_bounds([c.x() + ux * r0 * r, c.x() + ux * r1 * r], [c.y() + uy * r0 * r, c.y() + uy * r1 * r], pad)
+            for r0, r1 in zip(stops, stops[1:])]
+
+
+def hud_edge_rects(c: QPointF, r: float, rot_a: float, rot_b: float, pad: float) -> list[QRect]:
+    """A rotating HUD arc only changes pixels at its two ends."""
+    rects = []
+    for start, span in HUD_ARCS:
+        for edge in (start, start + span):
+            xs, ys = [], []
+            for rot in (rot_a, rot_b):
+                phi = math.radians(edge + rot)
+                for rr in (0.975 * r, r):
+                    xs.append(c.x() + rr * math.cos(phi))
+                    ys.append(c.y() - rr * math.sin(phi))
+            rects.append(_bounds(xs, ys, pad))
+    return rects
+
+
+@dataclass(frozen=True)
+class Motion:
+    """Where everything that moves is, sampled for one frame."""
+    train: float              # clock time driving the gear train
+    cage: float               # clock time driving the tourbillon cage
+    sec: float                # seconds hand & track, fraction of a turn
+    chrono: float | None      # chronograph hand, None while reset
+    hud: float                # HUD arc rotation, degrees
+    slow: tuple               # identity of the slow layer's content
+    stepped: bool             # mechanical / quartz: the train only moves on beats
 
 
 def _text_centered(p: QPainter, text: str, f, color, at: QPointF) -> None:
@@ -164,6 +226,7 @@ class MechanicalClock(QWidget):
         self._settings = settings
         self.setMinimumSize(260, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)    # paints its own backdrop
         self._train = solve_train(TRAIN, MODULE)
         self._gears = {g.spec.name: g for g in self._train}
         self._key: tuple | None = None
@@ -173,8 +236,14 @@ class MechanicalClock(QWidget):
         self._wheels: list[tuple] = []
         self._sprites: dict[str, Sprite] = {}
         self._paths: dict[str, QPainterPath] = {}
-        self._beat: int | None = None
-        self._beat_layers: dict[str, QPixmap] = {}
+        self._slow = QPixmap()
+        self._slow_key: tuple | None = None
+        self._base = QPixmap()                    # backdrop + movement plate, opaque
+        self._base_key: tuple | None = None
+        self._lower = QPixmap()                   # base + gear train
+        self._lower_key: tuple | None = None
+        self._backdrop = None
+        self._backdrop_version = 0
         self._boot_t0 = time.perf_counter()
         self._rebuild = QTimer(self)
         self._rebuild.setSingleShot(True)
@@ -182,13 +251,19 @@ class MechanicalClock(QWidget):
         self._rebuild.timeout.connect(self.update)
         self._pending_key: tuple | None = None
         self._pending_since = 0.0
-        self._needs_full = True
-        self._live = QRegion()          # what moves between beats: the balance wheel
-        self._live_rect = QRect()
+        self._last: Motion | None = None          # what the screen currently shows
+        self._frame_t = 0.0
+        self._frame_motion: Motion | None = None  # sampled by _on_frame, reused by paintEvent
+        self._day = (0, None)                     # (epoch second, date) memo
+        self._version = 0                         # bumped when the stopwatch / timer change
+        self._tb_rect = QRect()
+        self._inner_rect = QRect()
+        self._train_rects: list[QRect] = []
+        self._wheel_rects: list[QRect] = []
         self._spirals: list[QPolygonF] = []
         self._twist_max = 1.0
-        stopwatch.changed.connect(self.invalidate_beat)
-        countdown.changed.connect(self.invalidate_beat)
+        stopwatch.changed.connect(self.invalidate)
+        countdown.changed.connect(self.invalidate)
         engine.frame.connect(self._on_frame)
 
     # ── public ──
@@ -196,53 +271,104 @@ class MechanicalClock(QWidget):
         side = min(self.width(), self.height())
         return QPointF(self.width() / 2, self.height() / 2), max(20.0, side / 2 - 3)
 
+    def set_backdrop(self, painter) -> None:
+        """`painter(p, rect)` paints what lies behind the clock (rect in clock coordinates)."""
+        self._backdrop = painter
+        self.backdrop_changed()
+
+    def backdrop_changed(self) -> None:
+        self._backdrop_version += 1
+        self.update()
+
+    def moveEvent(self, event) -> None:
+        self.backdrop_changed()                   # a different part of the backdrop is behind us now
+        super().moveEvent(event)
+
     def restart_boot(self) -> None:
         self._boot_t0 = time.perf_counter()
 
-    def invalidate_beat(self) -> None:
-        self._beat = None
-        self._needs_full = True
+    def invalidate(self) -> None:
+        self._version += 1
+        self._last = self._frame_motion = None
         self.update()
 
-    def _on_frame(self, t: float) -> None:
-        bps = BEATS.get(self._settings.get("sweep", "mechanical"), 6)
-        steady = (self._key is not None and self._pending_key is None
-                  and time.perf_counter() - self._boot_t0 > 1.9)
-        if steady and math.floor(t * bps) == self._beat and not self._live.isEmpty():
-            self.update(self._live)
-        else:
-            self._needs_full = True
+    # ── frame scheduling ──
+    def _boot(self) -> float:
+        return _ease_out((time.perf_counter() - self._boot_t0) / 1.8)
+
+    def _motion(self, now: float, e: float) -> Motion:
+        rate = SWEEP_RATES.get(self._settings.get("sweep", "smooth"), 0)
+        t = quantise(now, rate)
+        local = datetime.fromtimestamp(t)
+        sec = (local.second + local.microsecond / 1e6) / 60.0 * e
+        chrono = None if self._sw.is_reset else (quantise(self._sw.elapsed(), rate) % 60.0) / 60.0
+        hud = quantise(now, rate and ESCAPEMENT_BPS) * HUD_ARC_SPEED % 360.0
+        return Motion(train=quantise(now, rate or SMOOTH_TRAIN_RATE), cage=t, sec=sec, chrono=chrono,
+                      hud=hud, slow=(int(now), self._version, e >= 1.0), stepped=rate > 0)
+
+    def _on_frame(self, now: float) -> None:
+        self._frame_t = now
+        self._frame_motion = None
+        last, e = self._last, self._boot()
+        if last is None or e < 1.0 or self._pending_key is not None:
             self.update()
+            return
+        m = self._frame_motion = self._motion(now, e)
+        if m.slow != last.slow or m.sec < last.sec or (m.chrono is None) != (last.chrono is None):
+            self.update()                         # new second, minute wrap or chrono start/reset
+            return
+        c, r = self.clock_geometry()
+        pad = r * 0.045 + 2                       # glow (0.02 r) + offset soft shadow (0.033 r)
+        rects = [self._tb_rect]                   # the balance never rests
+        if m.train != last.train:
+            rects += self._train_rects
+        if m.sec != last.sec:
+            rects += [a.united(b) for a, b in zip(needle_rects(c, r, last.sec, 0.22, 1.0, pad),
+                                                  needle_rects(c, r, m.sec, 0.22, 1.0, pad))]
+        if m.chrono is not None and m.chrono != last.chrono:
+            rects += [a.united(b) for a, b in zip(needle_rects(c, r, last.chrono, 0.24, 0.88, pad),
+                                                  needle_rects(c, r, m.chrono, 0.24, 0.88, pad))]
+        if m.hud != last.hud:
+            rects += hud_edge_rects(c, r, last.hud, m.hud, 9.0)
+        for rect in rects:
+            self.update(rect)
 
     def resizeEvent(self, event) -> None:
-        # Between beats only the balance wheel moves. (Qt repaints complex regions by their
-        # bounding box, so keeping this a single small rect is what makes frames cheap.)
         c, r = self.clock_geometry()
-        br = int(TB_R * r * 0.68) + 3
-        self._live_rect = QRect(int(c.x()) - br, int(c.y() + TB_D * r) - br, 2 * br, 2 * br)
-        self._live = QRegion(self._live_rect)
-        self._needs_full = True
+        cx, cy = c.x(), c.y()
+        half = TB_R * r * 1.02 + 3
+        self._tb_rect = QRectF(cx - half, cy + TB_D * r - half, 2 * half, 2 * half).toAlignedRect()
+        self._wheel_rects = []
+        for g in self._train:
+            h = g.r_outer * r + 9                 # sprite half-size: outer radius + glow margin
+            self._wheel_rects.append(QRectF(cx + g.x * r - h, cy + g.y * r - h, 2 * h, 2 * h).toAlignedRect())
+        # pinions sit on their wheels' arbors, inside the wheel's rect
+        self._train_rects = [rect for g, rect in zip(self._train, self._wheel_rects) if g.spec.spokes]
+        k = 0.95 * r / math.sqrt(2)               # anything inside this square misses the HUD
+        self._inner_rect = QRectF(cx - k, cy - k, 2 * k, 2 * k).toAlignedRect()
+        self._last = None
         super().resizeEvent(event)
 
     # ── cache management ──
-    def _ensure_layers(self, r: float, dpr: float, day) -> None:
+    def _ensure_layers(self, r: float, dpr: float, day) -> bool:
+        """Returns True when the caches were rebuilt."""
         key = (round(r, 1), dpr, day)
         if key == self._key:
-            return
+            return False
         if self._key is not None and self._key[1:] == key[1:]:
             # live window resize: stretch the old cache, rebuild once the size settles
             now = time.perf_counter()
             if key != self._pending_key:
                 self._pending_key, self._pending_since = key, now
                 self._rebuild.start()
-                return
+                return False
             if now - self._pending_since < 0.12:
                 self._rebuild.start()
-                return
+                return False
         self._build(r, dpr, day)
         self._key = key
         self._pending_key = None
-        self._beat = None
+        return True
 
     def _build(self, r: float, dpr: float, day) -> None:
         self._built_r = r
@@ -271,10 +397,12 @@ class MechanicalClock(QWidget):
             "under": layer(lambda p: self._paint_under(p, r)),
             "over": layer(lambda p: self._paint_over(p, r, day)),
             "glass": layer(lambda p: self._paint_glass(p, r)),
-            "hud_ring": layer(lambda p: self._paint_glow_ring(p, 0.996 * r, 1.3, 5.0, 150)),
             "sec_ring": layer(lambda p: self._paint_glow_ring(p, 0.865 * r, max(1.2, r * 0.006), r * 0.03, 230)),
+            "hud_ring": layer(lambda p: self._paint_glow_ring(p, 0.996 * r, 1.3, 5.0, 150)),
         }
-        self._beat_layers = {"lower": _canvas(2 * half, 2 * half, dpr), "upper": _canvas(2 * half, 2 * half, dpr)}
+        self._slow = _canvas(2 * half, 2 * half, dpr)
+        self._slow_key = None
+        self._base_key = None
 
     def _blit(self, p: QPainter, name: str, c: QPointF, s: float) -> None:
         pm = self._layers.get(name)
@@ -423,6 +551,56 @@ class MechanicalClock(QWidget):
         }
         for name, alpha in (("hour", 150), ("minute", 150), ("seconds", 120), ("chrono", 120), ("small", 130)):
             S[name + "_shadow"] = shadow(P[name], alpha)
+
+        def cap(p: QPainter) -> None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(_metal_ring_gradient(QPointF(0, 0), 20))
+            p.drawEllipse(QPointF(0, 0), r * 0.034, r * 0.034)
+            draw_jewel(p, QPointF(0, 0), r * 0.013)
+
+        S["cap"] = Sprite(QRectF(-r * 0.04, -r * 0.04, r * 0.08, r * 0.08), dpr, cap)
+
+        # tourbillon parts, drawn every frame, so pre-rendered once
+        ar = TB_R * r
+
+        def balance(p: QPainter) -> None:
+            rb = ar * 0.56
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor("#8d63d9"), ar * 0.07))
+            p.drawEllipse(QPointF(0, 0), rb, rb)
+            p.setPen(QPen(QColor("#c4a2ff"), max(0.6, ar * 0.012)))
+            p.drawEllipse(QPointF(0, 0), rb + ar * 0.03, rb + ar * 0.03)
+            p.setPen(QPen(QColor("#6a46b0"), ar * 0.055, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            for k in range(3):
+                a = k * TAU / 3 + 0.5
+                p.drawLine(T.polar(0, 0, ar * 0.08, a), T.polar(0, 0, rb, a))
+            p.setPen(QPen(T.qc("#08070c"), 0.6))
+            p.setBrush(QColor("#d9c4ff"))
+            for k in range(8):
+                p.drawEllipse(T.polar(0, 0, rb + ar * 0.035, k * TAU / 8 + 0.2), ar * 0.032, ar * 0.032)
+
+        def fork(p: QPainter) -> None:
+            p.fillPath(P["fork"], QColor("#5d5379"))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(T.qc("#c27dff"))
+            for sx in (-0.18, 0.18):
+                p.drawRect(QRectF((sx - 0.025) * ar, -0.06 * ar, 0.05 * ar, 0.07 * ar))
+
+        def cage(p: QPainter) -> None:
+            grad = QLinearGradient(QPointF(-ar, -ar), QPointF(ar, ar))
+            grad.setColorAt(0.0, QColor("#a99dd0"))
+            grad.setColorAt(0.5, QColor("#4b4266"))
+            grad.setColorAt(1.0, QColor("#8a7fb0"))
+            p.fillPath(P["cage"], grad)
+            p.strokePath(P["cage"], QPen(T.qc("#08070c", 220), 0.7))
+
+        jewel = ar * 0.08
+        S["balance"] = Sprite(QRectF(-0.68 * ar, -0.68 * ar, 1.36 * ar, 1.36 * ar), dpr, balance)
+        S["fork"] = Sprite(P["fork"].boundingRect().adjusted(-2, -0.05 * ar - 2, 2, 2), dpr, fork)
+        S["cage"] = Sprite(bounds(P["cage"], 2), dpr, cage)
+        S["tb_jewel"] = Sprite(QRectF(-1.6 * jewel, -1.6 * jewel, 3.2 * jewel, 3.2 * jewel), dpr,
+                               lambda p: draw_jewel(p, QPointF(0, 0), jewel))
+
         self._sprites = S
 
     # ── static layers ──
@@ -561,6 +739,7 @@ class MechanicalClock(QWidget):
                            ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")[day.weekday()], r)
         self._paint_chapter(p, r)
         self._paint_bezel(p, r)
+        p.strokePath(self._paths["hud_ticks"], QPen(T.qc(T.LINE_HI, 220), 1.0))    # static HUD scale
 
     def _paint_subdial(self, p: QPainter, c: QPointF, sr: float, kind: str) -> None:
         p.setPen(Qt.PenStyle.NoPen)
@@ -775,59 +954,109 @@ class MechanicalClock(QWidget):
     # ── frame composition ──
     def paintEvent(self, event) -> None:
         c, r = self.clock_geometry()
-        dpr = self.devicePixelRatioF()
-        now = time.time()
-        self._ensure_layers(r, dpr, datetime.fromtimestamp(now).date())
+        fresh = 0.0 <= time.time() - self._frame_t < 0.25
+        now = self._frame_t if fresh else time.time()
+        if int(now) != self._day[0]:
+            self._day = (int(now), datetime.fromtimestamp(now).date())
+        rebuilt = self._ensure_layers(r, self.devicePixelRatioF(), self._day[1])
         s = r / self._built_r
-        e = _ease_out((time.perf_counter() - self._boot_t0) / 1.8)
-        bps = BEATS.get(self._settings.get("sweep", "mechanical"), 6)
-        t = math.floor(now * bps) / bps                         # wall clock quantised to beats
+        e = self._boot()
+        m = self._frame_motion if fresh and self._frame_motion is not None else self._motion(now, e)
+        region = event.region()
+        steady = e >= 1.0 and abs(s - 1.0) < 1e-6
 
-        full, self._needs_full = self._needs_full, False
+        beats = math.floor(now * ESCAPEMENT_BPS)
+        lower_cached = steady and m.stepped        # train and escapement only move on beats
         p = _begin(self)
-        if e >= 1.0 and abs(s - 1.0) < 1e-6:
-            beat = math.floor(now * bps)
-            if beat != self._beat:
-                self._render_beat(r, t)
-                self._beat = beat
-                if not full:                 # the beat ticked during a partial repaint
-                    self._needs_full = True
-                    self.update()
-            origin = QPointF(c.x() - self._half, c.y() - self._half)
-            p.drawPixmap(origin, self._beat_layers["lower"])
-            self._paint_balance(p, c, r, now, t)
-            p.drawPixmap(origin, self._beat_layers["upper"])
+        if lower_cached:
+            p.drawPixmap(QPointF(0, 0), self._ensure_lower(c, r, m, beats))
+        elif steady:                                # smooth: draw only the wheels that were dirtied
+            p.drawPixmap(QPointF(0, 0), self._ensure_base(c))
+            for (g, pm, half), rect in zip(self._wheels, self._wheel_rects):
+                if region.intersects(rect):
+                    self._paint_wheel(p, c, r, 1.0, m.train, g, pm, half)
+        else:                                       # boot sweep-in or live resize
+            if self._backdrop is not None:
+                self._backdrop(p, event.rect())
+            else:
+                p.fillRect(event.rect(), QColor(T.BG))
+            self._blit(p, "under", c, s)
+            self._paint_gears(p, c, r, s, m.train)
+        if region.intersects(self._tb_rect):
+            if not lower_cached:
+                self._paint_escapement(p, c, r, s, m.cage, beats)
+            self._paint_carriage(p, c, r, s, m.cage, now)
+        if steady:
+            if self._slow_key != m.slow:
+                self._slow.fill(Qt.GlobalColor.transparent)
+                sp = _begin(self._slow)
+                self._paint_slow(sp, QPointF(self._half, self._half), r, 1.0, float(int(now)), 1.0)
+                sp.end()
+                self._slow_key = m.slow
+            p.drawPixmap(QPointF(c.x() - self._half, c.y() - self._half), self._slow)
         else:
-            self._paint_lower(p, c, r, s, t)
-            self._paint_balance(p, c, r, now, t)
-            self._paint_upper(p, c, r, s, t, e)
-        if not self._live_rect.contains(event.rect()):      # HUD rings advance with the beat too
-            self._paint_hud(p, c, r, t, e)
+            self._paint_slow(p, c, r, s, now, e)
+        pad = r * 0.045 + 2
+        hands = needle_rects(c, r, m.sec, 0.22, 1.0, pad)
+        if m.chrono is not None:
+            hands += needle_rects(c, r, m.chrono, 0.24, 0.88, pad)
+        if not steady or any(region.intersects(rect) for rect in hands):
+            self._paint_sweep(p, c, r, s, m, track=not self._tb_rect.contains(event.rect()))
+        if not self._inner_rect.contains(event.rect()):
+            self._paint_hud(p, c, r, m.hud, e)
         p.end()
+        self._last = None if rebuilt else m
 
-    def _render_beat(self, r: float, t: float) -> None:
-        centre = QPointF(self._half, self._half)
-        for name, fn in (("lower", lambda p: self._paint_lower(p, centre, r, 1.0, t)),
-                         ("upper", lambda p: self._paint_upper(p, centre, r, 1.0, t, 1.0))):
-            pm = self._beat_layers[name]
-            pm.fill(Qt.GlobalColor.transparent)
-            p = _begin(pm)
-            fn(p)
+    def _ensure_base(self, c: QPointF) -> QPixmap:
+        """Backdrop + movement plate composed once into an opaque image: one plain copy per
+        paint instead of two alpha blends."""
+        key = (self.size(), self._key, self._backdrop_version)
+        if key != self._base_key:
+            dpr = self.devicePixelRatioF()
+            self._base = QPixmap(max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
+            self._base.setDevicePixelRatio(dpr)
+            self._base.fill(QColor(T.BG))
+            p = _begin(self._base)
+            if self._backdrop is not None:
+                self._backdrop(p, self.rect())
+            self._blit(p, "under", c, 1.0)
             p.end()
+            self._base_key = key
+        return self._base
 
-    def _paint_lower(self, p: QPainter, c: QPointF, r: float, s: float, t: float) -> None:
-        self._blit(p, "under", c, s)
+    def _ensure_lower(self, c: QPointF, r: float, m: Motion, beats: int) -> QPixmap:
+        """Base + gear train + escapement, re-composed only when they step (stepped sweep modes)."""
+        base = self._ensure_base(c)
+        key = (m.train, m.cage, beats, self._base_key)
+        if key != self._lower_key:
+            if self._lower.size() != base.size():
+                self._lower = QPixmap(base.size())
+                self._lower.setDevicePixelRatio(base.devicePixelRatio())
+            p = _begin(self._lower)
+            p.drawPixmap(QPointF(0, 0), base)
+            self._paint_gears(p, c, r, 1.0, m.train)
+            self._paint_escapement(p, c, r, 1.0, m.cage, beats)
+            p.end()
+            self._lower_key = key
+        return self._lower
+
+    def _paint_gears(self, p: QPainter, c: QPointF, r: float, s: float, train: float) -> None:
         for g, pm, half in self._wheels:
-            angle = math.degrees(math.fmod(g.ratio * ROOT_OMEGA * t + g.phase, TAU))
-            p.save()
-            p.translate(c.x() + g.x * r, c.y() + g.y * r)
-            p.rotate(angle)
-            p.scale(s, s)
-            p.drawPixmap(QPointF(-half, -half), pm)
-            p.restore()
+            self._paint_wheel(p, c, r, s, train, g, pm, half)
 
+    @staticmethod
+    def _paint_wheel(p: QPainter, c: QPointF, r: float, s: float, train: float, g, pm: QPixmap, half: float) -> None:
+        p.save()
+        p.translate(c.x() + g.x * r, c.y() + g.y * r)
+        p.rotate(math.degrees(math.fmod(g.ratio * ROOT_OMEGA * train + g.phase, TAU)))
+        p.scale(s, s)
+        p.drawPixmap(QPointF(-half, -half), pm)
+        p.restore()
+
+    def _paint_escapement(self, p: QPainter, c: QPointF, r: float, s: float, t: float, beats: int) -> None:
+        """Aperture floor and the parts of the carriage that only move on a beat:
+        escape wheel and pallet fork."""
         ar = TB_R * r
-        beats = math.floor(t * ESCAPEMENT_BPS + 1e-6)
         p.save()
         p.translate(c.x(), c.y() + TB_D * r)
         floor = QRadialGradient(QPointF(0, 0), ar)
@@ -836,7 +1065,7 @@ class MechanicalClock(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(floor)
         p.drawEllipse(QPointF(0, 0), ar * 1.005, ar * 1.005)
-        p.rotate((t % 60.0) / 60.0 * 360.0)                    # cage: one turn per minute
+        p.rotate((t % 60.0) / 60.0 * 360.0)                    # the cage turns once a minute
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(T.qc("#4a4262"), ar * 0.05))
         p.drawEllipse(QPointF(0, 0), ar * 0.80, ar * 0.80)
@@ -847,74 +1076,60 @@ class MechanicalClock(QWidget):
         p.scale(s, s)
         p.drawPixmap(QPointF(-half, -half), pm)
         p.restore()
-        p.translate(0, -0.30 * ar)                              # pallet fork flicks left/right
-        p.rotate(9.0 if beats % 2 else -9.0)
-        p.fillPath(self._paths["fork"], QColor("#5d5379"))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(T.qc("#c27dff"))
-        for sx in (-0.18, 0.18):
-            p.drawRect(QRectF((sx - 0.025) * ar, -0.06 * ar, 0.05 * ar, 0.07 * ar))
+        self._sprites["fork"].draw(p, QPointF(0, -0.30 * ar), 9.0 if beats % 2 else -9.0, s)   # it flicks
         p.restore()
 
-    def _paint_balance(self, p: QPainter, c: QPointF, r: float, now: float, t: float) -> None:
+    def _paint_carriage(self, p: QPainter, c: QPointF, r: float, s: float, t: float, now: float) -> None:
+        """The continuously moving part of the tourbillon: balance, hairspring and cage."""
         ar = TB_R * r
+        S = self._sprites
         balance = 150.0 * math.sin(TAU * (ESCAPEMENT_BPS / 2.0) * now)
+        centre = QPointF(c.x(), c.y() + TB_D * r)
         p.save()
-        p.translate(c.x(), c.y() + TB_D * r)
-        p.rotate((t % 60.0) / 60.0 * 360.0 + balance)
-        rb = ar * 0.56
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor("#8d63d9"), ar * 0.07))
-        p.drawEllipse(QPointF(0, 0), rb, rb)
-        p.setPen(QPen(QColor("#c4a2ff"), max(0.6, ar * 0.012)))
-        p.drawEllipse(QPointF(0, 0), rb + ar * 0.03, rb + ar * 0.03)
-        p.setPen(QPen(QColor("#6a46b0"), ar * 0.055, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-        for k in range(3):
-            a = k * TAU / 3 + 0.5
-            p.drawLine(T.polar(0, 0, ar * 0.08, a), T.polar(0, 0, rb, a))
-        p.setPen(QPen(T.qc("#08070c"), 0.6))
-        p.setBrush(QColor("#d9c4ff"))
-        for k in range(8):
-            p.drawEllipse(T.polar(0, 0, rb + ar * 0.035, k * TAU / 8 + 0.2), ar * 0.032, ar * 0.032)
-        p.rotate(-balance)                                      # hairspring breathes with the balance
+        p.translate(centre)
+        p.rotate((t % 60.0) / 60.0 * 360.0)                    # the cage turns once a minute
+        S["balance"].draw(p, QPointF(0, 0), balance, s)
+        p.save()                                                # hairspring breathes with the balance
+        p.scale(s, s)
         p.setPen(QPen(T.qc(T.VIOLET_HI, 210), max(0.6, ar * 0.012)))
-        p.setBrush(Qt.BrushStyle.NoBrush)
         idx = round((math.radians(balance) * 0.9 / self._twist_max + 1) * 40)
-        p.scale(r / self._built_r, r / self._built_r)
         p.drawPolyline(self._spirals[max(0, min(80, idx))])
         p.restore()
+        S["cage"].draw(p, QPointF(0, 0), 0.0, s)
+        p.restore()
+        S["tb_jewel"].draw(p, centre, 0.0, s)
 
-    def _paint_upper(self, p: QPainter, c: QPointF, r: float, s: float, t: float, e: float) -> None:
-        local = datetime.fromtimestamp(t)
+    def _paint_slow(self, p: QPainter, c: QPointF, r: float, s: float, when: float, e: float) -> None:
+        """The over layer plus everything that moves too slowly to need per-frame updates."""
+        local = datetime.fromtimestamp(when)
         day_secs = local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1e6
         S = self._sprites
-
-        tb = QPointF(c.x(), c.y() + TB_D * r)                   # tourbillon cage on top of the balance
-        ar = TB_R * r
-        p.save()
-        p.translate(tb)
-        p.rotate((t % 60.0) / 60.0 * 360.0)
-        p.scale(s, s)
-        cage_grad = QLinearGradient(QPointF(-ar, -ar), QPointF(ar, ar))
-        cage_grad.setColorAt(0.0, QColor("#a99dd0"))
-        cage_grad.setColorAt(0.5, QColor("#4b4266"))
-        cage_grad.setColorAt(1.0, QColor("#8a7fb0"))
-        p.fillPath(self._paths["cage"], cage_grad)
-        p.strokePath(self._paths["cage"], QPen(T.qc("#08070c", 220), 0.7))
-        p.restore()
-        draw_jewel(p, tb, ar * 0.08)
-
         self._blit(p, "over", c, s)
+        self._paint_timer_bezel(p, c, r, when)
+        chrono_min = (self._sw.elapsed() / 60.0) % 30.0
+        sub_shadow = QPointF(SUB_R * r * 0.03, SUB_R * r * 0.05)
+        for pos, deg, sprite in ((QPointF(-SUB_D * r, 0), day_secs / 86400.0 * 360.0 * e, "small_violet"),
+                                 (QPointF(SUB_D * r, 0), chrono_min / 30.0 * 360.0, "small_magenta")):
+            S["small_shadow"].draw(p, c + pos + sub_shadow, deg, s)
+            S[sprite].draw(p, c + pos, deg, s)
+        shadow = c + QPointF(r * 0.007, r * 0.013)
+        for name, deg in (("hour", (day_secs / 3600.0) % 12.0 / 12.0 * 360.0 * e),
+                          ("minute", (day_secs / 60.0) % 60.0 / 60.0 * 360.0 * e)):
+            S[name + "_shadow"].draw(p, shadow, deg, s)
+            S[name].draw(p, c, deg, s)
+        self._blit(p, "glass", c, s)
 
-        frac = (day_secs % 60.0) / 60.0 * e                    # seconds track glow
-        if frac > 0.0005:
+    def _paint_sweep(self, p: QPainter, c: QPointF, r: float, s: float, m: Motion, track: bool) -> None:
+        """Seconds track, chronograph & seconds hands and the centre cap: the fast movers."""
+        S = self._sprites
+        if track and m.sec > 0.0005:
             p.save()
             p.translate(c)
-            p.setClipPath(_sector(0.84 * r, 0.9 * r, 90.0, -frac * 360.0))
+            p.setClipPath(_sector(0.84 * r, 0.9 * r, 90.0, -m.sec * 360.0))
             p.scale(s, s)
             p.drawPixmap(QPointF(-self._half, -self._half), self._layers["sec_ring"])
             p.restore()
-        head = T.polar(c.x(), c.y(), 0.865 * r, T.clock_angle(frac))
+        head = T.polar(c.x(), c.y(), 0.865 * r, T.clock_angle(m.sec))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(T.qc(T.VIOLET, 70))
         p.drawEllipse(head, r * 0.018, r * 0.018)
@@ -922,37 +1137,19 @@ class MechanicalClock(QWidget):
         p.drawEllipse(head, r * 0.007, r * 0.007)
         p.save()
         p.translate(c)
-        p.rotate(frac * 360.0)
+        p.rotate(m.sec * 360.0)
         p.setBrush(T.qc(T.VIOLET_HI))
         p.drawPolygon(QPolygonF([QPointF(0, -0.968 * r), QPointF(-0.013 * r, -0.995 * r),
                                  QPointF(0.013 * r, -0.995 * r)]))
         p.restore()
 
-        self._paint_timer_bezel(p, c, r, t)
-
-        hours = local.hour + local.minute / 60.0 + local.second / 3600.0
-        chrono = math.floor(self._sw.elapsed() * 6) / 6
-        sub_shadow = QPointF(SUB_R * r * 0.03, SUB_R * r * 0.05)
-        for pos, deg, sprite in ((QPointF(-SUB_D * r, 0), hours / 24.0 * 360.0 * e, "small_violet"),
-                                 (QPointF(SUB_D * r, 0), (chrono / 60.0) % 30.0 / 30.0 * 360.0, "small_magenta")):
-            S["small_shadow"].draw(p, c + pos + sub_shadow, deg, s)
-            S[sprite].draw(p, c + pos, deg, s)
-
         shadow = c + QPointF(r * 0.007, r * 0.013)
-        hands = [("hour", (day_secs / 3600.0) % 12.0 / 12.0 * 360.0 * e),
-                 ("minute", (day_secs / 60.0) % 60.0 / 60.0 * 360.0 * e)]
-        if not self._sw.is_reset:
-            hands.append(("chrono", (chrono % 60.0) / 60.0 * 360.0))
-        hands.append(("seconds", frac * 360.0))
+        hands = [] if m.chrono is None else [("chrono", m.chrono * 360.0)]
+        hands.append(("seconds", m.sec * 360.0))
         for name, deg in hands:
             S[name + "_shadow"].draw(p, shadow, deg, s)
             S[name].draw(p, c, deg, s)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_metal_ring_gradient(c, 20))
-        p.drawEllipse(c, r * 0.034, r * 0.034)
-        draw_jewel(p, c, r * 0.013)
-
-        self._blit(p, "glass", c, s)
+        S["cap"].draw(p, c, 0.0, s)
 
     def _paint_timer_bezel(self, p: QPainter, c: QPointF, r: float, t: float) -> None:
         """Project the countdown on the bezel the way a diver sets a dive bezel."""
@@ -979,16 +1176,13 @@ class MechanicalClock(QWidget):
         p.fillPath(tri, T.qc("#f5d6ff"))
         p.restore()
 
-    def _paint_hud(self, p: QPainter, c: QPointF, r: float, now: float, e: float) -> None:
+    def _paint_hud(self, p: QPainter, c: QPointF, r: float, rot: float, e: float) -> None:
+        """Glowing arcs that orbit the bezel: a fixed glow ring shown through rotating sectors,
+        so its pixels never change and only the arc ends need repainting."""
         p.save()
         p.translate(c)
         p.scale(r / self._built_r, r / self._built_r)
         p.setOpacity(e)
-        p.save()
-        p.rotate((now * 2.0) % 360.0)
-        p.strokePath(self._paths["hud_ticks"], QPen(T.qc(T.LINE_HI, 220), 1.0))
-        p.restore()
-        rot = (now * 6.0) % 360.0          # glowing arcs, counter-rotating: clip a glow ring
         p.rotate(-rot)
         p.setClipPath(self._paths["hud_clip"])
         p.rotate(rot)

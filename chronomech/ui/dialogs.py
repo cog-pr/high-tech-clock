@@ -271,9 +271,10 @@ class SettingsDialog(MechDialog):
 
         self.fmt = _Choice([("24H", True), ("12H", False)], settings["use_24h"])
         add("TIME FORMAT  /  表示形式", self.fmt)
-        self.sweep = _Choice([("MECHANICAL", "mechanical"), ("SMOOTH", "smooth"), ("QUARTZ", "quartz")],
+        self.sweep = _Choice([("SMOOTH", "smooth"), ("MECHANICAL", "mechanical"), ("QUARTZ", "quartz")],
                              settings["sweep"])
-        self.sweep.setToolTip("MECHANICAL: 6振動/秒の機械式運針  SMOOTH: 連続運針  QUARTZ: 1秒ステップ")
+        self.sweep.setToolTip("SMOOTH: 描画フレームごとになめらかに運針\n"
+                              "MECHANICAL: 6振動/秒で刻む機械式運針\nQUARTZ: 1秒ステップ")
         add("SWEEP  /  運針", self.sweep)
         self.fps = _Choice([("30 FPS", 30), ("60 FPS", 60)], settings["fps"] if settings["fps"] in (30, 60) else 60)
         self.fps.setToolTip("30 FPS で CPU 使用率を抑えられます")

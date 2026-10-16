@@ -3,7 +3,18 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QByteArray, QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRectF, Qt, QTimer
+from PySide6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -56,18 +67,32 @@ class Backdrop(QWidget):
     def invalidate(self) -> None:
         self._cache = None
         self.update()
+        if self._clock is not None:          # the clock is opaque and paints our pixels itself
+            self._clock.backdrop_changed()
 
     def resizeEvent(self, _event) -> None:
         self._cache = None
 
-    def paintEvent(self, event) -> None:
+    def _ensure_cache(self) -> QPixmap:
         if (self._cache is None or self._cache.deviceIndependentSize().toSize() != self.size()
                 or self._cache.devicePixelRatio() != self.devicePixelRatioF()):   # e.g. moved to another monitor
             self._cache = self._render()
+        return self._cache
+
+    def _blit(self, p: QPainter, target: QRectF, source: QRectF) -> None:
+        cache = self._ensure_cache()
+        dpr = cache.devicePixelRatio()
+        p.drawPixmap(target, cache, QRectF(source.topLeft() * dpr, source.size() * dpr))
+
+    def paint_behind(self, p: QPainter, child: QWidget, rect: QRect) -> None:
+        """Paint the backdrop under `child` (rect in child coordinates). This lets the clock be
+        an opaque widget, so its many small per-frame updates never repaint the window behind it."""
+        self._blit(p, QRectF(rect), QRectF(rect.translated(child.mapTo(self, QPoint(0, 0)))))
+
+    def paintEvent(self, event) -> None:
         p = QPainter(self)
         r = QRectF(event.rect())
-        p.drawPixmap(r, self._cache, QRectF(r.topLeft() * self._cache.devicePixelRatio(),
-                                           r.size() * self._cache.devicePixelRatio()))
+        self._blit(p, r, r)
 
     def _render(self) -> QPixmap:
         dpr = self.devicePixelRatioF()
@@ -219,6 +244,7 @@ class MainWindow(QWidget):
         grid.setRowStretch(0, 1)
         self.body.set_targets(self.clock, [self.world, self.calendar, self.astro],
                               [self.chrono, self.timer, self.alarm])
+        self.clock.set_backdrop(lambda p, rect: self.body.paint_behind(p, self.clock, rect))
         self.overlay = AlertOverlay(self.body)
         self._apply_display_prefs()
 
@@ -472,7 +498,7 @@ class MainWindow(QWidget):
         self.titlebar.mode = f"{mode.get(self.settings['sweep'], '')}   ·   {self.engine.fps} FPS"
         self.titlebar.update()
         self.astro.refresh()
-        self.clock.invalidate_beat()
+        self.clock.invalidate()
         for w in (self.world, self.alarm, self.astro):
             w.update()
 
