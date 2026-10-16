@@ -8,12 +8,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+SCHEMA = 2                          # bump when stored values need migrating
+
 DEFAULTS: dict[str, Any] = {
+    "version": SCHEMA,
     "use_24h": True,
     "tick_sound": False,
     "volume": 0.6,
     "fps": 60,
-    "sweep": "mechanical",          # mechanical | smooth | quartz
+    "sweep": "smooth",              # smooth | mechanical | quartz
     "always_on_top": False,
     "focus_mode": False,
     "world_clocks": [
@@ -67,6 +70,15 @@ class Settings:
         for key, value in raw.items():
             if key in DEFAULTS and _compatible(DEFAULTS[key], value):
                 self.data[key] = value
+        version = raw.get("version")
+        self._migrate(version if isinstance(version, int) and not isinstance(version, bool) else 1)
+
+    def _migrate(self, version: int) -> None:
+        # v1 wrote every default to disk, so its "mechanical" sweep just means "never changed";
+        # move those files to the new smooth default.
+        if version < 2 and self.data.get("sweep") == "mechanical":
+            self.data["sweep"] = "smooth"
+        self.data["version"] = SCHEMA
 
     def __getitem__(self, key: str) -> Any:
         return self.data[key]

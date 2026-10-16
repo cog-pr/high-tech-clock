@@ -14,8 +14,11 @@ from chronomech.core.alarms import Alarm, AlarmManager
 from chronomech.core.astro import moon_info, sun_info
 from chronomech.core.chrono import Stopwatch
 from chronomech.core.countdown import Countdown
+from PySide6.QtCore import QPointF
+
+from chronomech import theme as T
 from chronomech.core.settings import Settings
-from chronomech.ui.clock import MODULE, ROOT_OMEGA, TRAIN
+from chronomech.ui.clock import HUD_ARCS, MODULE, ROOT_OMEGA, TRAIN, hud_edge_rects, needle_rects, quantise
 from chronomech.ui.mechanics import solve_train
 
 app = QCoreApplication.instance() or QCoreApplication([])
@@ -44,6 +47,34 @@ class GearTrainTest(unittest.TestCase):
             if s.parent and s.angle is not None:
                 p, c = gears[s.parent], gears[s.name]
                 self.assertAlmostEqual(math.hypot(c.x - p.x, c.y - p.y), p.r_pitch + c.r_pitch, places=9)
+
+
+class SweepTest(unittest.TestCase):
+    def test_quantise(self):
+        self.assertEqual(quantise(12.3456, 0), 12.3456)             # smooth: untouched
+        self.assertAlmostEqual(quantise(12.40, 6), 12 + 2 / 6)      # mechanical: 1/6 s beats
+        self.assertEqual(quantise(12.99, 1), 12.0)                  # quartz: whole seconds
+
+    def test_needle_rects_cover_the_hand(self):
+        c, r = QPointF(400, 300), 250.0
+        for frac in (0.0, 0.1, 0.125, 0.37, 0.5, 0.81):
+            rects = needle_rects(c, r, frac, 0.22, 1.0, pad=4)
+            a = T.clock_angle(frac)
+            for k in range(-22, 101):                            # every point along the hand
+                d = k / 100 * r
+                pt = QPointF(c.x() + d * math.cos(a), c.y() + d * math.sin(a)).toPoint()
+                self.assertTrue(any(rect.contains(pt) for rect in rects), (frac, k))
+
+    def test_hud_edge_rects_cover_moving_arc_ends(self):
+        c, r = QPointF(400, 400), 300.0
+        rects = hud_edge_rects(c, r, 10.0, 10.4, pad=3)
+        self.assertEqual(len(rects), 2 * len(HUD_ARCS))
+        for start, span in HUD_ARCS:
+            for edge in (start, start + span):
+                for rot in (10.0, 10.2, 10.4):
+                    phi = math.radians(edge + rot)
+                    pt = QPointF(c.x() + 0.99 * r * math.cos(phi), c.y() - 0.99 * r * math.sin(phi)).toPoint()
+                    self.assertTrue(any(rect.contains(pt) for rect in rects), (edge, rot))
 
 
 class AlarmTest(unittest.TestCase):
@@ -168,6 +199,18 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(again["volume"], 0.25)
             self.assertFalse(again["use_24h"])
             self.assertEqual(again["fps"], 60)              # wrong type falls back to default
+
+    def test_smooth_sweep_is_default_and_v1_files_migrate(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "settings.json"
+            self.assertEqual(Settings(path)["sweep"], "smooth")
+            path.write_text('{"sweep": "mechanical", "fps": 30}', encoding="utf-8")   # v1: no version
+            migrated = Settings(path)
+            self.assertEqual(migrated["sweep"], "smooth")
+            self.assertEqual(migrated["fps"], 30)
+            migrated["sweep"] = "mechanical"                # an explicit choice made after the upgrade…
+            migrated.save()
+            self.assertEqual(Settings(path)["sweep"], "mechanical")   # …is kept
 
 
 if __name__ == "__main__":
